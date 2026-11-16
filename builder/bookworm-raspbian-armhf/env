@@ -1,0 +1,4 @@
+# Raspbian bookworm on armhf: built the shipped 32-bit kernels.
+BUILDER_PLATFORM="linux/arm/v7"
+BUILDER_CROSS_COMPILE="arm-linux-gnueabihf-"
+BUILDER_CC="arm-linux-gnueabihf-gcc-12"

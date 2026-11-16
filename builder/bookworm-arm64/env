@@ -1,0 +1,4 @@
+# Debian bookworm on arm64: built the shipped 64-bit kernels.
+BUILDER_PLATFORM="linux/arm64"
+BUILDER_CROSS_COMPILE="aarch64-linux-gnu-"
+BUILDER_CC="aarch64-linux-gnu-gcc-12"
