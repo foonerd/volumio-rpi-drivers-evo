@@ -1,0 +1,6 @@
+# Debian trixie on arm64: built the shipped 64-bit kernels.
+BUILDER_PLATFORM="linux/arm64"
+BUILDER_CROSS_COMPILE="aarch64-linux-gnu-"
+BUILDER_CC="aarch64-linux-gnu-gcc-14"
+# The shipped kernel was configured with a 32-bit companion compiler present.
+BUILDER_CROSS_COMPILE_COMPAT="arm-linux-gnueabihf-"
