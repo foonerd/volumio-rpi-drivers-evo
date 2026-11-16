@@ -1,0 +1,54 @@
+#!/bin/bash
+# pack <target>: compile the device tree overlays of the target's set and
+# pack them with the modules of every flavour into the release archive.
+# Runs inside any builder, after tools/build has run for every flavour.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+. "$(dirname "$0")/lib.sh"
+load_target "${1:-}"
+
+PKG="$TWORK/pkg/$NAME"
+for fl in $FLAVOURS; do
+	rel="$TARGET_RELEASE_BASE-$fl"
+	[ -n "$(find "$PKG/lib/modules/$rel/updates" -name '*.ko.xz' 2>/dev/null | head -n1)" ] ||
+		die "flavour $fl has not been built; run tools/build $TARGET $fl"
+done
+
+# Device tree overlays are the same for every flavour.
+rm -rf "${PKG:?}/boot"
+for u in $(units); do
+	load_unit "$u"
+	for o in $OVERLAYS; do
+		dts="$UNITDIR/files/arch/arm/boot/dts/overlays/$o-overlay.dts"
+		[ -f "$dts" ] || die "$u: missing $o-overlay.dts"
+		note "overlay: $o"
+		mkdir -p "$PKG/boot/overlays"
+		cpp -nostdinc -undef -D__DTS__ -x assembler-with-cpp \
+			-I "$SRC/include" -I "$SRC/arch/arm/boot/dts" "$dts" |
+			dtc -@ -q -I dts -O dtb -o "$PKG/boot/overlays/$o.dtbo"
+	done
+done
+
+# Firmware the drivers load, the same for every flavour.
+rm -rf "${PKG:?}/lib/firmware"
+for u in $(units); do
+	load_unit "$u"
+	[ -n "$FIRMWARE_URL" ] || continue
+	[ "$RELEASE" = yes ] || continue
+	[ -n "$FIRMWARE_DIR" ] || die "$u: FIRMWARE_URL is set but FIRMWARE_DIR is not"
+	note "firmware: $u"
+	mkdir -p "$PKG/lib/firmware/$FIRMWARE_DIR"
+	while read -r sum name; do
+		case $sum in '' | '#'*) continue ;; esac
+		f="$WORK/dl/firmware/$TARGET_SET/$u/$name"
+		[ -f "$f" ] || die "$u: firmware $name has not been fetched; run tools/fetch $TARGET"
+		verify_sha256 "$f" "$sum"
+		cp "$f" "$PKG/lib/firmware/$FIRMWARE_DIR/$name"
+	done <"$UNITDIR/firmware.sha256"
+done
+
+mkdir -p "$ROOT/output"
+tar -C "$TWORK/pkg" --sort=name --owner=0 --group=0 --numeric-owner \
+	-czf "$ROOT/output/$NAME.tar.gz" "$NAME"
+(cd "$ROOT/output" && sha256sum "$NAME.tar.gz" >"$NAME.tar.gz.sha256")
+note "archive: output/$NAME.tar.gz"

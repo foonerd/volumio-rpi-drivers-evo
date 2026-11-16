@@ -1,0 +1,188 @@
+#!/bin/bash
+# build [-a] <target> <flavour>: build the units of the target's set for one
+# flavour. Runs inside the flavour's builder.
+#
+# -a  also build the units marked RELEASE="no". Such a build goes to a
+#     separate directory and is never packed into the release archive.
+#
+# The build refuses to continue unless the builder reproduces the shipped
+# kernel's configuration exactly, the compiler identification included.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+. "$(dirname "$0")/lib.sh"
+
+all_units=no
+if [ "${1:-}" = "-a" ]; then
+	all_units=yes
+	shift
+fi
+load_target "${1:-}"
+fl=${2:-}
+[ -n "$fl" ] || die "usage: build [-a] <target> <flavour>"
+[ -f "$SRC/.prepared" ] || die "run tools/fetch $TARGET first"
+
+read -r arch builder _ _ <<<"$(flavour_fields "$fl")"
+load_builder "$builder"
+rel="$TARGET_RELEASE_BASE-$fl"
+OUT="$TWORK/out/$fl"
+HDR="$TWORK/headers/$fl"
+JOBS=${JOBS:-$(nproc)}
+[ -f "$HDR/Module.symvers" ] || die "run tools/fetch $TARGET first"
+
+"$ROOT/tools/check" "$TARGET" ||
+	die "the set is out of date for this kernel; nothing was built"
+
+if [ "$all_units" = yes ]; then
+	PKG="$TWORK/pkg-all/$NAME"
+else
+	PKG="$TWORK/pkg/$NAME"
+fi
+rm -rf "$PKG/lib/modules/$rel"
+mkdir -p "$PKG"
+
+# config_view <file>: every configuration entry, in a comparable order.
+config_view() {
+	grep -E '^(CONFIG_[A-Za-z0-9_]+=|# CONFIG_[A-Za-z0-9_]+ is not set)' "$1" | sort
+}
+
+# device_keys <module>: the devices a module claims, one per line. A USB
+# device counts by vendor and product, however narrowly the module matches
+# its interfaces; everything else counts by its full alias.
+device_keys() {
+	modinfo -F alias "$1" |
+		sed -E 's/^(usb:v[0-9A-Fa-f]{4}p[0-9A-Fa-f]{4}).*/\1/' | sort -u
+}
+
+# kmake <args>: run the kernel build system for this flavour.
+kmake() {
+	make -C "$SRC" O="$OUT" ARCH="$arch" CROSS_COMPILE="$BUILDER_CROSS_COMPILE" \
+		${BUILDER_CROSS_COMPILE_COMPAT:+CROSS_COMPILE_COMPAT="$BUILDER_CROSS_COMPILE_COMPAT"} \
+		CC="$BUILDER_CC" KERNELRELEASE="$rel" -j"$JOBS" "$@"
+}
+
+# prepare: an output tree configured exactly as the shipped kernel, able to
+# build modules against its symbol versions. It is rebuilt whenever the
+# builder or its compiler changes.
+prepare() {
+	local stamp got
+	stamp="$BUILDER: $("$BUILDER_CC" --version | head -n1)"
+	[ "$(cat "$OUT/.prepared" 2>/dev/null)" = "$stamp" ] && return 0
+	note "$fl: preparing with $stamp"
+	rm -rf "$OUT"
+	mkdir -p "$OUT"
+	cp "$HDR/.config" "$OUT/.config"
+	kmake olddefconfig >/dev/null
+	if ! diff <(config_view "$HDR/.config") <(config_view "$OUT/.config") >"$OUT/config.diff"; then
+		cat "$OUT/config.diff" >&2
+		die "$fl: builder $BUILDER does not reproduce the configuration of the shipped kernel"
+	fi
+	kmake modules_prepare >"$OUT/prepare.log" 2>&1 ||
+		{ tail -n 30 "$OUT/prepare.log" >&2; die "$fl: modules_prepare failed"; }
+	cp "$HDR/Module.symvers" "$OUT/Module.symvers"
+	got=$(cat "$OUT/include/config/kernel.release")
+	[ "$got" = "$rel" ] || die "$fl: tree reports release '$got', expected '$rel'"
+	echo "$stamp" >"$OUT/.prepared"
+}
+
+# build_unit <unit>: stage the unit's kernel directory with the unit's files
+# in place, build its modules against the shipped kernel, and collect them.
+build_unit() {
+	local u=$1 root sroot stage log goals=() extra=() kcflags kv k m mods ko vm dest lost
+	load_unit "$u"
+	[ -n "$DIR" ] || return 0
+	if [ "$RELEASE" != yes ] && [ "$all_units" != yes ]; then
+		return 0
+	fi
+	case " $ONLY_FLAVOURS " in
+	"  " | *" $fl "*) ;;
+	*) return 0 ;;
+	esac
+	note "$fl: $u"
+	root="$TWORK/stage/$fl/$u"
+	stage="$root/$DIR"
+	log="$root/build.log"
+	rm -rf "$root"
+	mkdir -p "$stage"
+	# The stage is a small tree with the unit's directory at its kernel
+	# path, built from its top. Together with the two path maps this makes
+	# the modules record source paths as the kernel's own build does,
+	# relative to the kernel tree, wherever the build runs.
+	printf 'obj-y := %s/\n' "$DIR" >"$root/Kbuild"
+	kcflags="-fmacro-prefix-map=$root/= -fmacro-prefix-map=$SRC/="
+	[ "$WHOLE_DIR" = yes ] || cp -a "$SRC/$DIR/." "$stage/"
+	if [ -d "$UNITDIR/files/$DIR" ]; then
+		cp -a "$UNITDIR/files/$DIR/." "$stage/"
+	elif [ -z "$KCONFIG" ] || [ "$WHOLE_DIR" = yes ]; then
+		# A unit without files only makes sense when it switches on
+		# drivers the kernel has but does not build.
+		die "$u: no files under $DIR and no KCONFIG"
+	fi
+
+	for kv in $KCONFIG; do
+		k=${kv%%=*}
+		extra+=("CONFIG_$kv")
+		case ${kv#*=} in
+		m) kcflags+=" -DCONFIG_${k}_MODULE=1" ;;
+		y) kcflags+=" -DCONFIG_${k}=1" ;;
+		*) die "$u: KCONFIG entry must be =m or =y: $kv" ;;
+		esac
+	done
+
+	if [ "$MODULES" = "*" ]; then
+		goals=(modules)
+	else
+		for m in $MODULES; do goals+=("$DIR/$m.ko"); done
+	fi
+	kmake M="$root" ${extra[@]+"${extra[@]}"} KCFLAGS="$kcflags" "${goals[@]}" \
+		>"$log" 2>&1 ||
+		{ tail -n 40 "$log" >&2; die "$fl: $u failed to build"; }
+
+	if [ "$MODULES" = "*" ]; then
+		mods=$(find "$stage" -maxdepth 1 -name '*.ko' -printf '%f\n' | sed 's/\.ko$//' | sort)
+		[ -n "$mods" ] || die "$fl: $u built no modules"
+	else
+		mods=$MODULES
+	fi
+
+	# A replacement must not serve fewer devices than the kernel's own
+	# module. Build the kernel's version of the same directory and compare
+	# the devices each module claims.
+	if [ -d "$UNITDIR/files/$DIR" ]; then
+		sroot="$TWORK/stage/$fl/$u.stock"
+		rm -rf "$sroot"
+		mkdir -p "$sroot/$DIR"
+		cp -a "$SRC/$DIR/." "$sroot/$DIR/"
+		printf 'obj-y := %s/\n' "$DIR" >"$sroot/Kbuild"
+		# The kernel may not build a module the unit adds; that is fine.
+		kmake -k M="$sroot" KCFLAGS="-fmacro-prefix-map=$sroot/= -fmacro-prefix-map=$SRC/=" \
+			"${goals[@]}" >"$sroot/build.log" 2>&1 || true
+		for m in $mods; do
+			[ -f "$sroot/$DIR/$m.ko" ] || continue
+			lost=$(comm -13 <(device_keys "$stage/$m.ko") <(device_keys "$sroot/$DIR/$m.ko"))
+			if [ -n "$lost" ]; then
+				echo "$lost" | sed "s/^/  $m: the kernel's module also serves /" >&2
+				die "$fl: $u: $m.ko serves fewer devices than the kernel's own module"
+			fi
+		done
+	fi
+
+	dest="$PKG/lib/modules/$rel/updates/$DIR"
+	mkdir -p "$dest"
+	for m in $mods; do
+		ko="$stage/$m.ko"
+		[ -f "$ko" ] || die "$fl: $u: $m.ko was not built"
+		vm=$(modinfo -F vermagic "$ko")
+		[ "${vm%% *}" = "$rel" ] ||
+			die "$fl: $u: $m.ko is built for '${vm%% *}', not '$rel'"
+		[ -n "$(modprobe --dump-modversions "$ko" 2>/dev/null)" ] ||
+			die "$fl: $u: $m.ko carries no symbol versions"
+		"${BUILDER_CROSS_COMPILE}strip" --strip-debug -o "$dest/$m.ko" "$ko"
+		xz --check=crc32 --lzma2=dict=1MiB -f "$dest/$m.ko"
+	done
+}
+
+prepare
+for u in $(units); do
+	build_unit "$u"
+done
+note "$fl: done"

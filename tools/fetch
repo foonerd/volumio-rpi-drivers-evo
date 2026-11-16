@@ -1,0 +1,80 @@
+#!/bin/bash
+# fetch <target>: download and verify the inputs of a target, then prepare
+# the kernel source tree and, per flavour, the configuration and symbol
+# versions of the shipped kernel. Firmware files named by the units of the
+# target's set are downloaded and verified as well.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+. "$(dirname "$0")/lib.sh"
+load_target "${1:-}"
+
+DL="$WORK/dl"
+mkdir -p "$DL" "$TWORK"
+
+# download <url> <file> <sha256>: download once, verify every time.
+download() {
+	local url=$1 file=$2 sum=$3
+	if [ ! -f "$file" ]; then
+		note "downloading $(basename "$file")"
+		mkdir -p "$(dirname "$file")"
+		curl -fL --retry 3 --silent --show-error -o "$file.part" "$url"
+		mv "$file.part" "$file"
+	fi
+	verify_sha256 "$file" "$sum"
+}
+
+download "$SOURCE_POOL/$SOURCE_ORIG" "$DL/$SOURCE_ORIG" "$SOURCE_ORIG_SHA256"
+download "$SOURCE_POOL/$SOURCE_PACKAGING" "$DL/$SOURCE_PACKAGING" "$SOURCE_PACKAGING_SHA256"
+for fl in $FLAVOURS; do
+	read -r _ _ deb sum <<<"$(flavour_fields "$fl")"
+	download "$SOURCE_POOL/$deb" "$DL/$deb" "$sum"
+done
+
+# Kernel source: the upstream tarball with the packaging's patch series
+# applied, which is the source the kernel packages were built from.
+if [ ! -f "$SRC/.prepared" ]; then
+	note "preparing kernel source"
+	rm -rf "$SRC" "$TWORK/packaging"
+	mkdir -p "$SRC" "$TWORK/packaging"
+	tar -xJf "$DL/$SOURCE_ORIG" -C "$SRC" --strip-components=1
+	tar -xJf "$DL/$SOURCE_PACKAGING" -C "$TWORK/packaging"
+	series="$TWORK/packaging/debian/patches/series"
+	[ -f "$series" ] || die "packaging has no patch series"
+	while read -r entry _; do
+		case $entry in '' | '#'*) continue ;; esac
+		patch -d "$SRC" -p1 -s -f --no-backup-if-mismatch \
+			<"$TWORK/packaging/debian/patches/$entry" ||
+			die "packaging patch failed to apply: $entry"
+	done <"$series"
+	touch "$SRC/.prepared"
+fi
+
+# Per flavour: the configuration and symbol versions of the shipped kernel.
+for fl in $FLAVOURS; do
+	read -r _ _ deb _ <<<"$(flavour_fields "$fl")"
+	hdr="$TWORK/headers/$fl"
+	if [ ! -f "$hdr/Module.symvers" ]; then
+		tmp=$(mktemp -d)
+		dpkg-deb -x "$DL/$deb" "$tmp"
+		from="$tmp/usr/src/linux-headers-$TARGET_RELEASE_BASE-$fl"
+		[ -f "$from/.config" ] && [ -f "$from/Module.symvers" ] ||
+			die "$deb does not carry .config and Module.symvers"
+		mkdir -p "$hdr"
+		cp "$from/.config" "$from/Module.symvers" "$hdr/"
+		rm -rf "$tmp"
+	fi
+done
+
+# Firmware: a unit lists the files its drivers load in firmware.sha256, as
+# "<sha256>  <file name>", and says where they come from.
+for u in $(units); do
+	load_unit "$u"
+	[ -n "$FIRMWARE_URL" ] || continue
+	[ -f "$UNITDIR/firmware.sha256" ] || die "$u: FIRMWARE_URL is set but there is no firmware.sha256"
+	while read -r sum name; do
+		case $sum in '' | '#'*) continue ;; esac
+		download "$FIRMWARE_URL/$name" "$DL/firmware/$TARGET_SET/$u/$name" "$sum"
+	done <"$UNITDIR/firmware.sha256"
+done
+
+note "inputs ready for $TARGET"

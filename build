@@ -1,0 +1,105 @@
+#!/bin/bash
+# build [-a | -c] <target> [flavour...]: fetch the inputs of a target and
+# build it.
+#
+# Each flavour is built inside its own builder: a container of the same
+# distribution, architecture and compiler that built the shipped kernel.
+# With no flavours named, every flavour is built and the release archive is
+# written to output/. A build of named flavours, or with -a, is left in the
+# work directory.
+#
+# -a  also build the units marked RELEASE="no".
+# -c  do not build: fetch the inputs and report every replaced file whose
+#     kernel version differs from the recorded copy, with the difference.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")" && pwd)
+
+mode=build
+opt=()
+case ${1:-} in
+-a)
+	opt=(-a)
+	shift
+	;;
+-c)
+	mode=check
+	shift
+	;;
+esac
+[ $# -ge 1 ] || {
+	echo "usage: build [-a | -c] <target> [flavour...]" >&2
+	exit 2
+}
+target=$1
+shift
+conf="$ROOT/targets/$target.conf"
+[ -f "$conf" ] || {
+	echo "error: no such target: $target" >&2
+	exit 2
+}
+# shellcheck source=/dev/null
+. "$conf"
+flavours=${*:-$FLAVOURS}
+
+# builder_of <flavour>: name of the builder the flavour is built in.
+builder_of() {
+	local var="FLAVOUR_${1//-/_}" fields
+	[ -n "${!var:-}" ] || {
+		echo "error: target $target has no flavour $1" >&2
+		exit 2
+	}
+	read -r -a fields <<<"${!var}"
+	echo "${fields[1]}"
+}
+
+# in_builder <builder> <command...>: run a command inside a builder, building
+# its image first if needed. The repository is always mounted at /build, so
+# the paths recorded in the modules do not depend on where it is checked out.
+in_builder() {
+	local builder=$1 image
+	shift
+	# shellcheck source=/dev/null
+	. "$ROOT/builder/$builder/env"
+	image="volumio-rpi-drivers-evo:$builder"
+	docker build -q --platform "$BUILDER_PLATFORM" -t "$image" "$ROOT/builder/$builder" >/dev/null
+	docker run --rm --platform "$BUILDER_PLATFORM" --user "$(id -u):$(id -g)" \
+		-e HOME=/tmp -v "$ROOT:/build" -w /build "$image" "$@"
+}
+
+if [ "$mode" = check ]; then
+	# shellcheck disable=SC2086
+	set -- $flavours
+	builder=$(builder_of "$1")
+	in_builder "$builder" tools/fetch "$target"
+	status=0
+	in_builder "$builder" tools/check -d "$target" || status=$?
+	in_builder "$builder" tools/upstream "$target"
+	exit "$status"
+fi
+
+full=no
+if [ "$flavours" = "$FLAVOURS" ] && [ ${#opt[@]} -eq 0 ]; then
+	full=yes
+	rm -rf "$ROOT/work/$target/pkg"
+fi
+
+fetched=no
+for fl in $flavours; do
+	builder=$(builder_of "$fl")
+	if [ "$fetched" = no ]; then
+		in_builder "$builder" tools/fetch "$target"
+		fetched=yes
+	fi
+	in_builder "$builder" tools/build ${opt[@]+"${opt[@]}"} "$target" "$fl"
+done
+
+if [ "$full" = yes ]; then
+	in_builder "$builder" tools/pack "$target"
+fi
+
+# What the upstream projects offer beyond this build. A report, never a
+# failure.
+in_builder "$builder" tools/upstream "$target"

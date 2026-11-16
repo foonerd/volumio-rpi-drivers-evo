@@ -1,0 +1,60 @@
+#!/bin/bash
+# check [-d] <target> [kernel tree]: compare the stock copies kept in the
+# target's set with a kernel source tree.
+#
+# Every replacement file in a set sits beside the stock file it was derived
+# from. If the kernel's file no longer matches that copy, the replacement is
+# out of date for this kernel and has to be redone before it is used.
+#
+# -d  also print the difference between the recorded copy and the kernel's
+#     file, which is the change to carry into the replacement.
+#
+# Exit status: 0 when every recorded copy matches, 1 otherwise.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+. "$(dirname "$0")/lib.sh"
+
+show=no
+if [ "${1:-}" = "-d" ]; then
+	show=yes
+	shift
+fi
+load_target "${1:-}"
+TREE=${2:-$SRC}
+[ -f "$TREE/Makefile" ] || die "no kernel tree at $TREE (run tools/fetch $TARGET first)"
+
+moved=0
+for u in $(units); do
+	load_unit "$u"
+	[ -d "$UNITDIR/stock" ] || continue
+	while read -r f; do
+		rel=${f#"$UNITDIR/stock/"}
+		if [ ! -f "$TREE/$rel" ]; then
+			echo "gone from kernel:  $u: $rel"
+			moved=1
+		elif ! cmp -s "$f" "$TREE/$rel"; then
+			echo "stock changed:     $u: $rel ($(diff "$f" "$TREE/$rel" | grep -c '^[<>]') lines)"
+			if [ "$show" = yes ]; then
+				diff -u --label "recorded/$rel" --label "kernel/$rel" "$f" "$TREE/$rel" || true
+			fi
+			moved=1
+		fi
+	done < <(find "$UNITDIR/stock" -type f | sort)
+
+	# A unit that replaces a whole directory also has to notice files the
+	# kernel added to it.
+	if [ "$WHOLE_DIR" = yes ] && [ -d "$TREE/$DIR" ]; then
+		while read -r f; do
+			rel=${f#"$TREE/"}
+			if [ ! -f "$UNITDIR/stock/$rel" ]; then
+				echo "new in kernel:     $u: $rel"
+				moved=1
+			fi
+		done < <(find "$TREE/$DIR" -maxdepth 1 -type f | sort)
+	fi
+done
+
+if [ "$moved" = 0 ]; then
+	note "set $TARGET_SET matches the kernel source of $TARGET"
+fi
+exit "$moved"

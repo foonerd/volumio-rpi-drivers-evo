@@ -1,0 +1,120 @@
+#!/bin/bash
+# upstream <target>: for every unit that follows an upstream project, fetch
+# that project's current state and report what it offers beyond the unit:
+# how far it has moved, which source files it has added, and which devices
+# it serves that the unit does not.
+#
+# This is a report. It never fails a build: what an upstream project did
+# between two builds is not a property of the build.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+. "$(dirname "$0")/lib.sh"
+load_target "${1:-}"
+
+UP="$WORK/upstream"
+mkdir -p "$UP"
+
+# device_ids <dir>: the device table entries found in a source tree, one per
+# line as "<bus> <vendor>:<device>".
+device_ids() {
+	grep -rhoiE '(USB_DEVICE(_AND_INTERFACE_INFO)?|PCI_DEVICE|SDIO_DEVICE)\([^)]*\)' \
+		"$1" --include='*.c' --include='*.h' 2>/dev/null |
+		tr 'A-Z' 'a-z' |
+		sed -E 's/[[:space:]]+//g
+			s/^usb_device(_and_interface_info)?\(([^,]+),([^,)]+).*/usb \2:\3/
+			s/^pci_device\(([^,]+),([^,)]+).*/pci \1:\2/
+			s/^sdio_device\(([^,]+),([^,)]+).*/sdio \1:\2/' |
+		sort -u
+}
+
+followed=0
+for u in $(units); do
+	load_unit "$u"
+	[ -n "$UPSTREAM" ] || continue
+	followed=$((followed + 1))
+	echo
+	note "$u follows $UPSTREAM ($UPSTREAM_BRANCH)"
+
+	repo="$UP/$u.git"
+	if [ ! -d "$repo" ]; then
+		git init -q --bare "$repo"
+		git -C "$repo" remote add origin "$UPSTREAM"
+	fi
+
+	if [ -n "$UPSTREAM_PATH" ]; then
+		# One file or directory of a large project: fetch only the two
+		# commits involved, and look at that path alone.
+		if ! git -C "$repo" fetch -q --depth=1 --filter=blob:none origin "$UPSTREAM_BRANCH" 2>/dev/null; then
+			echo "    upstream could not be reached; nothing to report"
+			continue
+		fi
+		head=$(git -C "$repo" rev-parse FETCH_HEAD)
+		when=$(git -C "$repo" log -1 --format=%cs "$head")
+		if [ "$head" = "$UPSTREAM_REF" ]; then
+			echo "    the unit is at upstream's current commit ${head:0:12} ($when)"
+			continue
+		fi
+		if ! git -C "$repo" fetch -q --depth=1 --filter=blob:none origin "$UPSTREAM_REF" 2>/dev/null; then
+			echo "    upstream is at ${head:0:12} ($when); the unit's commit ${UPSTREAM_REF:0:12} could not be fetched to compare"
+			continue
+		fi
+		changed=$(git -C "$repo" diff --numstat "$UPSTREAM_REF" "$head" -- "$UPSTREAM_PATH" 2>/dev/null |
+			awk '{a += $1; r += $2} END {if (NR) print a " lines added, " r " removed"}')
+		if [ -z "$changed" ]; then
+			echo "    upstream is at ${head:0:12} ($when); $UPSTREAM_PATH is unchanged since the unit was taken"
+			continue
+		fi
+		echo "    unit taken from ${UPSTREAM_REF:0:12}; upstream is at ${head:0:12} ($when)"
+		echo "    $UPSTREAM_PATH has changed: $changed"
+		tree="$UP/$u.head"
+		rm -rf "$tree"
+		mkdir -p "$tree"
+		git -C "$repo" archive "$head" "$UPSTREAM_PATH" | tar -x -C "$tree"
+		new_ids=$(comm -13 <(device_ids "$UNITDIR/files") <(device_ids "$tree"))
+		if [ -n "$new_ids" ]; then
+			echo "    devices upstream serves that the unit does not: $(echo "$new_ids" | wc -l)"
+			echo "$new_ids" | sed 's/^/      /'
+		else
+			echo "    upstream serves no device the unit does not"
+		fi
+		continue
+	fi
+
+	if ! git -C "$repo" fetch -q --filter=blob:none origin "$UPSTREAM_BRANCH" 2>/dev/null; then
+		echo "    upstream could not be reached; nothing to report"
+		continue
+	fi
+	head=$(git -C "$repo" rev-parse FETCH_HEAD)
+	when=$(git -C "$repo" log -1 --format=%cs "$head")
+	if [ "$head" = "$UPSTREAM_REF" ]; then
+		echo "    the unit is at upstream's current commit ${head:0:12} ($when)"
+		continue
+	fi
+	ahead=$(git -C "$repo" rev-list --count "$UPSTREAM_REF..$head" 2>/dev/null || echo "an unknown number of")
+	echo "    unit taken from ${UPSTREAM_REF:0:12}; upstream is at ${head:0:12} ($when), $ahead commits later"
+	git -C "$repo" log --format='      %cs %s' -n 8 "$UPSTREAM_REF..$head" 2>/dev/null | cut -c1-110 || true
+
+	tree="$UP/$u.head"
+	rm -rf "$tree"
+	mkdir -p "$tree"
+	git -C "$repo" archive "$head" | tar -x -C "$tree"
+
+	new_ids=$(comm -13 <(device_ids "$UNITDIR/files") <(device_ids "$tree"))
+	if [ -n "$new_ids" ]; then
+		echo "    devices upstream serves that the unit does not: $(echo "$new_ids" | wc -l)"
+		echo "$new_ids" | sed 's/^/      /'
+	else
+		echo "    upstream serves no device the unit does not"
+	fi
+	new_files=$(comm -13 \
+		<(find "$UNITDIR/files/$DIR" -maxdepth 1 -type f \( -name '*.c' -o -name '*.h' \) -printf '%f\n' | sort) \
+		<(find "$tree" -maxdepth 1 -type f \( -name '*.c' -o -name '*.h' \) -printf '%f\n' | sort))
+	if [ -n "$new_files" ]; then
+		echo "    source files upstream has that the unit does not: $(echo "$new_files" | tr '\n' ' ')"
+	fi
+done
+
+if [ "$followed" = 0 ]; then
+	note "no unit of set $TARGET_SET follows an upstream project"
+fi
+exit 0

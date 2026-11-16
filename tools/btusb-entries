@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Build a replacement btusb.c for one kernel: the kernel's own file plus the
+device entries mainline has for chips this kernel's driver already handles.
+
+usage: btusb-entries <mainline btusb_main.c> <kernel btusb.c> <output> <mainline commit>
+"""
+import re
+import sys
+
+main_path, stock_path, out_path, commit = sys.argv[1:5]
+main = open(main_path, errors="replace").read()
+stock = open(stock_path, errors="replace").read()
+
+ENTRY = re.compile(
+    r"\{\s*USB_DEVICE\(\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*\)\s*,"
+    r"\s*\.driver_info\s*=\s*([^}]+?)\}\s*,", re.S)
+
+
+def quirks(text):
+    """The body of quirks_table[]."""
+    m = re.search(r"static const struct usb_device_id quirks_table\[\] = \{(.*?)\n\};", text, re.S)
+    if not m:
+        raise SystemExit("no quirks_table found")
+    return m.group(1), m.start(1), m.end(1)
+
+
+def entries(body):
+    """[(vid, pid, flags, group)] in table order, group = last comment line."""
+    out = []
+    pos = 0
+    group = None
+    for m in re.finditer(r"/\*\s*(.+?)\s*\*/|" + ENTRY.pattern, body, re.S):
+        if m.group(1) is not None:
+            if "\n" not in m.group(1):
+                group = m.group(1)
+            continue
+        flags = " | ".join(f.strip() for f in m.group(4).replace("\n", " ").split("|"))
+        out.append((m.group(2).lower(), m.group(3).lower(), flags, group))
+    return out
+
+
+mbody, _, _ = quirks(main)
+sbody, sstart, send = quirks(stock)
+have = {(v, p) for v, p, _, _ in entries(sbody)}
+defined = set(re.findall(r"#define\s+(BTUSB_[A-Z0-9_]+)\s", stock))
+
+# Chip families whose handling is already in this kernel's driver and its
+# helpers, so that a table entry is all a device needs.
+FAMILIES = ("MediaTek", "Realtek", "QCA ROME", "QCA WCN6855")
+# Chips mainline handles with code this kernel does not have.
+NEEDS_CODE = ("QCC2072", "Otter Peak", "Wildcat")
+
+added, skipped = [], []
+for v, p, flags, group in entries(mbody):
+    if (v, p) in have:
+        continue
+    g = group or ""
+    ok = any(f in g for f in FAMILIES) and not any(n in g for n in NEEDS_CODE)
+    ok = ok and all(f in defined for f in flags.split(" | "))
+    (added if ok else skipped).append((v, p, flags, g))
+
+lines = ["",
+         "\t/*",
+         "\t * Devices the mainline kernel serves and this kernel does not yet.",
+         "\t * The chips are ones this driver already handles; only the entries",
+         "\t * are new. From drivers/bluetooth/btusb_main.c of mainline commit",
+         "\t * %s." % commit,
+         "\t */"]
+last = None
+for v, p, flags, g in added:
+    if g != last:
+        lines.append("\t/* %s */" % g)
+        last = g
+    parts = flags.split(" | ")
+    first = "\t{ USB_DEVICE(%s, %s), .driver_info = %s" % (v, p, parts[0])
+    if len(parts) == 1:
+        lines.append(first + " },")
+    else:
+        lines.append(first + " |")
+        for f in parts[1:-1]:
+            lines.append("\t\t\t\t\t\t     %s |" % f)
+        lines.append("\t\t\t\t\t\t     %s }," % parts[-1])
+block = "\n".join(lines) + "\n"
+
+# Insert before the terminating entry of the table.
+term = re.search(r"\n\t\{ \}\s*/\* Terminating entry \*/", sbody)
+if not term:
+    raise SystemExit("no terminating entry found in quirks_table")
+cut = sstart + term.start()
+open(out_path, "w").write(stock[:cut] + block + stock[cut:])
+
+print("added %d entries; left out %d that need code or flags this kernel lacks" % (len(added), len(skipped)))
+for v, p, flags, g in skipped:
+    print("  left out %s:%s  %s  [%s]" % (v, p, g, flags))
